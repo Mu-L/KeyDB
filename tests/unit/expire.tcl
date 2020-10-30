@@ -310,7 +310,7 @@ start_server {tags {"expire"}} {
             }
         }
         $rd2 exec
-        after 3000
+        after 3500
         assert_equal [r dbsize] 0
     }
 
