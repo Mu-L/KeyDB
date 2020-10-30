@@ -526,7 +526,7 @@ int moduleCreateEmptyKey(RedisModuleKey *key, int type) {
         obj = createZsetZiplistObject();
         break;
     case REDISMODULE_KEYTYPE_HASH:
-        obj = createHashObject();
+        obj = createHashObject(false /*fNested*/);
         break;
     default: return REDISMODULE_ERR;
     }

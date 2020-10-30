@@ -261,10 +261,17 @@ robj *createIntsetObject(void) {
     return o;
 }
 
-robj *createHashObject(void) {
-    unsigned char *zl = ziplistNew();
-    robj *o = createObject(OBJ_HASH, zl);
-    o->encoding = OBJ_ENCODING_ZIPLIST;
+robj *createHashObject(bool fNested) {
+    robj *o = nullptr;
+    if (fNested) {
+        dict *d = dictCreate(&nestedHashDictType,NULL);
+        o = createObject(OBJ_HASH, d);
+        o->encoding = OBJ_ENCODING_NHT;
+    } else {
+        unsigned char *zl = ziplistNew();
+        o = createObject(OBJ_HASH, zl);
+        o->encoding = OBJ_ENCODING_ZIPLIST;
+    }
     return o;
 }
 
@@ -346,6 +353,7 @@ void freeZsetObject(robj_roptr o) {
 
 void freeHashObject(robj_roptr o) {
     switch (o->encoding) {
+    case OBJ_ENCODING_NHT:
     case OBJ_ENCODING_HT:
         dictRelease((dict*) ptrFromObj(o));
         break;

@@ -795,6 +795,7 @@ typedef struct RedisModuleDigest {
 #define OBJ_ENCODING_RAW 0     /* Raw representation */
 #define OBJ_ENCODING_INT 1     /* Encoded as integer */
 #define OBJ_ENCODING_HT 2      /* Encoded as hash table */
+#define OBJ_ENCODING_NHT 3      /* Encoded as nested hash table */
 #define OBJ_ENCODING_ZIPMAP 3  /* Encoded as zipmap */
 #define OBJ_ENCODING_LINKEDLIST 4 /* No longer used: old list encoding. */
 #define OBJ_ENCODING_ZIPLIST 5 /* Encoded as ziplist */
@@ -1927,6 +1928,7 @@ extern struct sharedObjectsStruct shared;
 extern dictType objectKeyPointerValueDictType;
 extern dictType objectKeyHeapPointerValueDictType;
 extern dictType setDictType;
+extern dictType nestedHashDictType;
 extern dictType zsetDictType;
 extern dictType clusterNodesDictType;
 extern dictType clusterNodesBlackListDictType;
@@ -2154,7 +2156,7 @@ robj *createQuicklistObject(void);
 robj *createZiplistObject(void);
 robj *createSetObject(void);
 robj *createIntsetObject(void);
-robj *createHashObject(void);
+robj *createHashObject(bool fNested);
 robj *createZsetObject(void);
 robj *createZsetZiplistObject(void);
 robj *createStreamObject(void);
@@ -2437,7 +2439,7 @@ void hashTypeCurrentFromZiplist(hashTypeIterator *hi, int what,
 sds hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what);
 void hashTypeCurrentObject(hashTypeIterator *hi, int what, unsigned char **vstr, unsigned int *vlen, long long *vll);
 sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what);
-robj *hashTypeLookupWriteOrCreate(client *c, robj *key);
+robj *hashTypeLookupWriteOrCreate(client *c, robj *key, bool fNested);
 robj *hashTypeGetValueObject(robj_roptr o, sds field);
 int hashTypeSet(robj *o, sds field, sds value, int flags);
 
@@ -2733,7 +2735,8 @@ void appendCommand(client *c);
 void strlenCommand(client *c);
 void zrankCommand(client *c);
 void zrevrankCommand(client *c);
-void hsetCommand(client *c);
+void nhsetCommand(client *c);
+void hmsetCommand(client *c);
 void hsetnxCommand(client *c);
 void hgetCommand(client *c);
 void hmsetCommand(client *c);

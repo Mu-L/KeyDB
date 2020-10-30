@@ -106,17 +106,43 @@ const char *hashTypeGetFromHashTable(robj_roptr o, const char *field) {
  * If *vll is populated *vstr is set to NULL, so the caller
  * can always check the function return by checking the return value
  * for C_OK and checking if vll (or vstr) is NULL. */
-int hashTypeGetValue(robj_roptr o, sds field, const unsigned char **vstr, unsigned int *vlen, long long *vll) {
+int hashTypeGetValue(robj_roptr o, sds *rgfield, size_t cfield, const unsigned char **vstr, unsigned int *vlen, long long *vll) {
     if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+        if (cfield != 1)
+            return C_ERR;
         *vstr = NULL;
-        if (hashTypeGetFromZiplist(o, field, vstr, vlen, vll) == 0)
+        if (hashTypeGetFromZiplist(o, rgfield[0], vstr, vlen, vll) == 0)
             return C_OK;
     } else if (o->encoding == OBJ_ENCODING_HT) {
+        if (cfield != 1)
+            return C_ERR;
         const char *value;
-        if ((value = hashTypeGetFromHashTable(o, field)) != NULL) {
+        if ((value = hashTypeGetFromHashTable(o, rgfield[0])) != NULL) {
             *vstr = (const unsigned char*) value;
             *vlen = sdslen(value);
             return C_OK;
+        }
+    } else if (o->encoding == OBJ_ENCODING_NHT) {
+        robj_roptr oCur = o;
+        for (size_t ifield = 0; ifield < cfield-1; ++ifield) {
+            dictEntry *de = dictFind((dict*)ptrFromObj(o), rgfield[ifield]);
+            if (de == nullptr) return C_ERR;
+            robj *oT = (robj*)(de->v.val);
+            if (oT->type != OBJ_HASH || oT->encoding != OBJ_ENCODING_NHT)
+                return C_ERR;
+            oCur = oT;
+        }
+        if (oCur->type == OBJ_STRING) {
+            switch (oCur->encoding) {
+                case OBJ_ENCODING_EMBSTR:
+                case OBJ_ENCODING_RAW:
+                    *vstr = (unsigned char*)ptrFromObj(oCur);
+                    *vlen = strlen(szFromObj(oCur));
+                    break;
+                case OBJ_ENCODING_INT:
+                    *vll = (long long)ptrFromObj(oCur);
+                    break;
+            }
         }
     } else {
         serverPanic("Unknown hash encoding");
@@ -133,7 +159,7 @@ robj *hashTypeGetValueObject(robj_roptr o, sds field) {
     unsigned int vlen;
     long long vll;
 
-    if (hashTypeGetValue(o,field,&vstr,&vlen,&vll) == C_ERR) return NULL;
+    if (hashTypeGetValue(o,&field,1,&vstr,&vlen,&vll) == C_ERR) return NULL;
     if (vstr) return createStringObject((char*)vstr,vlen);
     else return createStringObjectFromLongLong(vll);
 }
@@ -448,10 +474,10 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
     return sdsfromlonglong(vll);
 }
 
-robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
+robj *hashTypeLookupWriteOrCreate(client *c, robj *key, bool fNested) {
     robj *o = lookupKeyWrite(c->db,key);
     if (o == NULL) {
-        o = createHashObject();
+        o = createHashObject(fNested);
         dbAdd(c->db,key,o);
     } else {
         if (o->type != OBJ_HASH) {
@@ -513,7 +539,7 @@ void hashTypeConvert(robj *o, int enc) {
 
 void hsetnxCommand(client *c) {
     robj *o;
-    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1],false)) == NULL) return;
     hashTypeTryConversion(o,c->argv,2,3);
 
     if (hashTypeExists(o, szFromObj(c->argv[2]))) {
@@ -527,7 +553,48 @@ void hsetnxCommand(client *c) {
     }
 }
 
-void hsetCommand(client *c) {
+void nhsetCommand(client *c) {
+    int i;
+    robj *o;
+
+    if (c->argc < 3) {
+        addReplyErrorFormat(c,"wrong number of arguments for '%s' command",c->cmd->name);
+        return;
+    }
+
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1], true)) == NULL) return;
+
+    if (o->encoding != OBJ_ENCODING_NHT) {
+        addReplyErrorFormat(c,"Key is not a nested hash");
+        return;
+    }
+
+    robj *oN = o;
+    for (i = 2; i < c->argc-2; i++) {
+        if (oN->type != OBJ_HASH || oN->encoding != OBJ_ENCODING_NHT) {
+            addReplyErrorFormat(c,"Invalid object type");
+            return;
+        }
+        dictEntry *de = dictFind((dict*)ptrFromObj(oN), szFromObj(c->argv[i]));
+        if (de == nullptr) {
+            robj *oNew = createHashObject(true);
+            serverAssert(dictAdd((dict*)ptrFromObj(oN), sdsdup(szFromObj(c->argv[i])), oNew) == DICT_OK);
+            de = dictFind((dict*)ptrFromObj(oN), szFromObj(c->argv[i]));
+        }
+        oN = (robj*)dictGetVal(de);
+    }
+    
+    if (dictAdd((dict*)ptrFromObj(oN), sdsdup(szFromObj(c->argv[c->argc-2])), c->argv[c->argc-1]) == DICT_OK) {
+        c->argv[c->argc-1]->addref();
+    }
+
+    addReplyLongLong(c, 1);
+    signalModifiedKey(c,c->db,c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_HASH,"nhset",c->argv[1],c->db->id);
+    g_pserver->dirty++;
+}
+
+void hmsetCommand(client *c) {
     int i, created = 0;
     robj *o;
 
@@ -536,11 +603,12 @@ void hsetCommand(client *c) {
         return;
     }
 
-    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1], false)) == NULL) return;
     hashTypeTryConversion(o,c->argv,2,c->argc-1);
 
-    for (i = 2; i < c->argc; i += 2)
+    for (i = 2; i < c->argc; i += 2) {
         created += !hashTypeSet(o,szFromObj(c->argv[i]),szFromObj(c->argv[i+1]),HASH_SET_COPY);
+    }
 
     /* HMSET (deprecated) and HSET return value is different. */
     char *cmdname = szFromObj(c->argv[0]);
@@ -564,8 +632,9 @@ void hincrbyCommand(client *c) {
     unsigned int vlen;
 
     if (getLongLongFromObjectOrReply(c,c->argv[3],&incr,NULL) != C_OK) return;
-    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
-    if (hashTypeGetValue(o,szFromObj(c->argv[2]),&vstr,&vlen,&value) == C_OK) {
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1],false)) == NULL) return;
+    auto key = szFromObj(c->argv[2]);
+    if (hashTypeGetValue(o,&key,1,&vstr,&vlen,&value) == C_OK) {
         if (vstr) {
             if (string2ll((char*)vstr,vlen,&value) == 0) {
                 addReplyError(c,"hash value is not an integer");
@@ -600,8 +669,9 @@ void hincrbyfloatCommand(client *c) {
     unsigned int vlen;
 
     if (getLongDoubleFromObjectOrReply(c,c->argv[3],&incr,NULL) != C_OK) return;
-    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
-    if (hashTypeGetValue(o,szFromObj(c->argv[2]),&vstr,&vlen,&ll) == C_OK) {
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1],false)) == NULL) return;
+    auto field = szFromObj(c->argv[2]);
+    if (hashTypeGetValue(o,&field,1,&vstr,&vlen,&ll) == C_OK) {
         if (vstr) {
             if (string2ld((char*)vstr,vlen,&value) == 0) {
                 addReplyError(c,"hash value is not a float");
@@ -641,7 +711,7 @@ void hincrbyfloatCommand(client *c) {
     decrRefCount(newobj);
 }
 
-static void addHashFieldToReply(client *c, robj_roptr o, sds field) {
+static void addHashFieldToReply(client *c, robj_roptr o, robj **rgfield, size_t cfield) {
     int ret;
 
     if (o == nullptr) {
@@ -654,7 +724,7 @@ static void addHashFieldToReply(client *c, robj_roptr o, sds field) {
         unsigned int vlen = UINT_MAX;
         long long vll = LLONG_MAX;
 
-        ret = hashTypeGetFromZiplist(o, field, &vstr, &vlen, &vll);
+        ret = hashTypeGetFromZiplist(o, szFromObj(rgfield[0]), &vstr, &vlen, &vll);
         if (ret < 0) {
             addReplyNull(c);
         } else {
@@ -666,11 +736,24 @@ static void addHashFieldToReply(client *c, robj_roptr o, sds field) {
         }
 
     } else if (o->encoding == OBJ_ENCODING_HT) {
-        const char* value = hashTypeGetFromHashTable(o, field);
+        const char* value = hashTypeGetFromHashTable(o, szFromObj(rgfield[0]));
         if (value == NULL)
             addReplyNull(c);
         else
             addReplyBulkCBuffer(c, value, sdslen(value));
+    } else if (o->encoding == OBJ_ENCODING_NHT) {
+        robj_roptr oCur = o;
+        for (size_t ifield = 0; ifield < cfield; ++ifield) {
+            if (oCur->type != OBJ_HASH || oCur->encoding != OBJ_ENCODING_NHT) { addReplyNull(c); return; }
+            dictEntry *de = dictFind((dict*)ptrFromObj(oCur), szFromObj(rgfield[ifield]));
+            if (de == nullptr) { addReplyNull(c); return; }
+            robj *oT = (robj*)dictGetVal(de);
+            oCur = oT;
+        }
+        if (oCur->type != OBJ_STRING) {
+            addReplyNull(c); return;
+        }
+        addReplyBulk(c, oCur);
     } else {
         serverPanic("Unknown hash encoding");
     }
@@ -682,7 +765,7 @@ void hgetCommand(client *c) {
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp])) == nullptr ||
         checkType(c,o,OBJ_HASH)) return;
 
-    addHashFieldToReply(c, o, szFromObj(c->argv[2]));
+    addHashFieldToReply(c, o, c->argv + 2, c->argc-2);
 }
 
 void hmgetCommand(client *c) {
@@ -699,7 +782,7 @@ void hmgetCommand(client *c) {
 
     addReplyArrayLen(c, c->argc-2);
     for (i = 2; i < c->argc; i++) {
-        addHashFieldToReply(c, o, szFromObj(c->argv[i]));
+        addHashFieldToReply(c, o, c->argv + i, 1);
     }
 }
 
@@ -745,6 +828,10 @@ void hstrlenCommand(client *c) {
 
     if ((o = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == nullptr ||
         checkType(c,o,OBJ_HASH)) return;
+    if (o->encoding == OBJ_ENCODING_NHT) {
+        addReplyError(c, "Cannot be used with nested hashes");
+        return;
+    }
     addReplyLongLong(c,hashTypeGetValueLength(o,szFromObj(c->argv[2])));
 }
 
@@ -844,7 +931,8 @@ void hrenameCommand(client *c) {
     if ((o = lookupKeyWriteOrReply(c,c->argv[1],shared.null[c->resp])) == nullptr ||
         checkType(c,o,OBJ_HASH)) return;
 
-    if (hashTypeGetValue(o, szFromObj(c->argv[2]), &vstr, &vlen, &ll) != C_OK)
+    auto key = szFromObj(c->argv[2]);
+    if (hashTypeGetValue(o, &key, 1, &vstr, &vlen, &ll) != C_OK)
     {
         addReplyError(c, "hash key doesn't exist");
         return;

@@ -662,6 +662,8 @@ int rdbSaveObjectType(rio *rdb, robj_roptr o) {
             return rdbSaveType(rdb,RDB_TYPE_HASH_ZIPLIST);
         else if (o->encoding == OBJ_ENCODING_HT)
             return rdbSaveType(rdb,RDB_TYPE_HASH);
+        else if (o->encoding == OBJ_ENCODING_NHT)
+            return rdbSaveType(rdb,RDB_TYPE_NESTED_HASH);
         else
             serverPanic("Unknown hash encoding");
     case OBJ_STREAM:
@@ -910,6 +912,39 @@ ssize_t rdbSaveObject(rio *rdb, robj_roptr o, robj *key) {
                 nwritten += n;
                 if ((n = rdbSaveRawString(rdb,(unsigned char*)value,
                         sdslen(value))) == -1)
+                {
+                    dictReleaseIterator(di);
+                    return -1;
+                }
+                nwritten += n;
+            }
+            dictReleaseIterator(di);
+        } else if (o->encoding == OBJ_ENCODING_NHT) {
+            dictIterator *di = dictGetIterator((dict*)ptrFromObj(o));
+            dictEntry *de;
+
+            if ((n = rdbSaveLen(rdb,dictSize((dict*)ptrFromObj(o)))) == -1) {
+                dictReleaseIterator(di);
+                return -1;
+            }
+            nwritten += n;
+
+            while((de = dictNext(di)) != NULL) {
+                sds field = (sds)dictGetKey(de);
+
+                if ((n = rdbSaveRawString(rdb,(unsigned char*)field,
+                        sdslen(field))) == -1)
+                {
+                    dictReleaseIterator(di);
+                    return -1;
+                }
+                nwritten += n;
+                robj *o = (robj*)dictGetVal(de);
+                if ((n = rdbSaveObjectType(rdb, o)) == -1) {
+                    dictReleaseIterator(di);
+                    return -1;
+                }
+                if ((n = rdbSaveObject(rdb,o,nullptr)) == -1)
                 {
                     dictReleaseIterator(di);
                     return -1;
@@ -1671,7 +1706,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, uint64_t mvcc_tstamp) {
         len = rdbLoadLen(rdb, NULL);
         if (len == RDB_LENERR) return NULL;
 
-        o = createHashObject();
+        o = createHashObject(false /*fNested*/);
 
         /* Too many entries? Use a hash table. */
         if (len > g_pserver->hash_max_ziplist_entries)
@@ -1725,6 +1760,44 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, uint64_t mvcc_tstamp) {
                 sdsfree(field);
                 decrRefCount(o);
                 return NULL;
+            }
+
+            /* Add pair to hash table */
+            ret = dictAdd((dict*)ptrFromObj(o), field, value);
+            if (ret == DICT_ERR) {
+                rdbExitReportCorruptRDB("Duplicate keys detected");
+            }
+        }
+
+        /* All pairs should be read by now */
+        serverAssert(len == 0);
+    } else if (rdbtype == RDB_TYPE_NESTED_HASH) {
+        uint64_t len;
+        int ret;
+        sds field;
+        robj *value;
+
+        len = rdbLoadLen(rdb, NULL);
+        if (len == RDB_LENERR) return NULL;
+
+        o = createHashObject(true /*fNested*/);
+
+        dictExpand((dict*)ptrFromObj(o),len);
+
+        /* Load remaining fields and values into the hash table */
+        while (len > 0) {
+            len--;
+            /* Load encoded strings */
+            if ((field = (sds)rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL)) == NULL) {
+                decrRefCount(o);
+                return nullptr;
+            }
+            
+            int type = rdbLoadObjectType(rdb);
+            if ((value = rdbLoadObject(type, rdb, nullptr, OBJ_MVCC_INVALID)) == nullptr) {
+                sdsfree(field);
+                decrRefCount(o);
+                return nullptr;
             }
 
             /* Add pair to hash table */

@@ -526,7 +526,11 @@ struct redisCommand redisCommandTable[] = {
      "write no-script fast @sortedset @blocking",
      0,NULL,1,-2,1,0,0,0},
 
-    {"hset",hsetCommand,-4,
+    {"hset",hmsetCommand,-4,
+     "write use-memory fast @hash",
+     0,NULL,1,1,1,0,0,0},
+
+    {"nhset",nhsetCommand,-4,
      "write use-memory fast @hash",
      0,NULL,1,1,1,0,0,0},
 
@@ -534,11 +538,11 @@ struct redisCommand redisCommandTable[] = {
      "write use-memory fast @hash",
      0,NULL,1,1,1,0,0,0},
 
-    {"hget",hgetCommand,3,
+    {"hget",hgetCommand,-3,
      "read-only fast @hash",
      0,NULL,1,1,1,0,0,0},
 
-    {"hmset",hsetCommand,-4,
+    {"hmset",hmsetCommand,-4,
      "write use-memory fast @hash",
      0,NULL,1,1,1,0,0,0},
 
@@ -1340,6 +1344,16 @@ dictType setDictType = {
     dictSdsKeyCompare,         /* key compare */
     dictSdsDestructor,         /* key destructor */
     NULL                       /* val destructor */
+};
+
+/* Nested Hash dictionary type. Keys are SDS strings, values are ot used. */
+dictType nestedHashDictType = {
+    dictSdsHash,               /* hash function */
+    NULL,                      /* key dup */
+    NULL,                      /* val dup */
+    dictSdsKeyCompare,         /* key compare */
+    dictSdsDestructor,         /* key destructor */
+    dictObjectDestructor,      /* val destructor */
 };
 
 /* Sorted sets hash (note: a skiplist is used in addition to the hash table) */
